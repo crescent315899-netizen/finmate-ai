@@ -13,7 +13,7 @@ It is designed to remain useful with no credentials: opening `/app` without a si
 - Bills with overdue/upcoming/paid states. Marking a bill paid adds one linked ledger entry, and undoing it removes the linked entry—so forecasts do not double-count it.
 - Deterministic forecast with integer-minor-unit arithmetic, transparent inputs, custom expected-spending adjustment, and shortfall warnings.
 - Assistant UI with a server-side optional AI provider and an honest, rules-based fallback. Budget proposals require explicit review and approval before they change a budget.
-- Activity history, JSON export, Supabase migrations, RLS policies, same-owner reference guards, and atomic database RPCs for paid bills and approved budget proposals.
+- Activity history, JSON export, Supabase migrations, RLS policies, same-owner reference guards, non-destructive cross-device sync, and atomic database RPCs for paid bills and approved budget proposals.
 
 ## Technology
 
@@ -53,7 +53,7 @@ available now − unpaid bills − expected remaining spending = month-end estim
 ## Supabase setup
 
 1. Create a Supabase project and set its Site URL to your eventual production URL. Add both the production URL and `http://localhost:3000/auth` to Auth Redirect URLs.
-2. In the SQL editor, apply the migrations in filename order—[001_finmate_schema.sql](supabase/migrations/001_finmate_schema.sql), [002_security_hardening.sql](supabase/migrations/002_security_hardening.sql), then [20261015180542_data_api_security_and_indexes.sql](supabase/migrations/20261015180542_data_api_security_and_indexes.sql)—or use `supabase db push` after linking a project.
+2. In the SQL editor, apply the migrations in filename order—[001_finmate_schema.sql](supabase/migrations/001_finmate_schema.sql), [002_security_hardening.sql](supabase/migrations/002_security_hardening.sql), [20261015180542_data_api_security_and_indexes.sql](supabase/migrations/20261015180542_data_api_security_and_indexes.sql), then [20261016090000_bill_payment_integrity.sql](supabase/migrations/20261016090000_bill_payment_integrity.sql)—or use `supabase db push` after linking a project.
 3. Copy `.env.example` to `.env.local` and set only the project URL and **anon** key:
 
    ```env
