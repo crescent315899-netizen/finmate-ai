@@ -38,9 +38,18 @@ export async function POST(request: Request) {
   const key = process.env.OPENAI_API_KEY;
   if (!key) return json({ mode: "rules", answer: fallback });
   try {
-    const response = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL ?? "gpt-4.1-mini", input: [{ role: "system", content: "You are FinMate AI. Explain only the supplied financial summary. Never claim to have made changes, guarantee results, or give regulated financial advice. Be concise and transparent." }, { role: "user", content: `Question: ${parsed.data.question}\nSummary: available ${money(summary.availableBalanceMinor)}; forecast ${money(summary.projectedBalanceMinor)}; unpaid bills ${money(summary.unpaidBillsMinor)}; expected remaining spending ${money(summary.expectedRemainingMinor)}.` }], max_output_tokens: 220 }), signal: AbortSignal.timeout(12_000) });
+  const response = await fetch(
+     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`, 
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: fallback }] }]
+        })
+      }
+    );
     if (!response.ok) throw new Error("Provider unavailable");
-    const body = await response.json() as { output_text?: string };
-    return json({ mode: "ai", answer: typeof body.output_text === "string" ? body.output_text.trim() || fallback : fallback });
-  } catch { return json({ mode: "rules", answer: `${fallback} (The optional AI provider is unavailable, so this is a rules-based explanation.)` }); }
+    const body = await response.json();
+    const output_text = body.candidates?.[0]?.content?.parts?.[0]?.text;
+    return json({ mode: "ai", answer: typeof output_text === "string" ? output_text.trim() || fallback : fallback });
 }
