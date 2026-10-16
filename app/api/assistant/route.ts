@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import { assistantRequestSchema } from "@/lib/schemas";
 import { formatMoney } from "@/lib/finance";
-
 export const runtime = "nodejs";
 
 const WINDOW_MS = 5 * 60 * 1_000;
