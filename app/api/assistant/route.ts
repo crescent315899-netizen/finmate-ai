@@ -35,12 +35,49 @@ export async function POST(request: Request) {
   const fallback = summary.shortfall
     ? `Your plan currently ends about ${money(Math.abs(summary.projectedBalanceMinor))} below zero. The first place to look is the ${money(summary.expectedRemainingMinor)} reserved for additional spending; unpaid bills of ${money(summary.unpaidBillsMinor)} should remain reserved.`
     : `Your estimate ends with ${money(summary.projectedBalanceMinor)}. That includes ${money(summary.unpaidBillsMinor)} in unpaid bills and ${money(summary.expectedRemainingMinor)} for future spending. It is an estimate, not a guarantee.`;
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) return json({ mode: "rules", answer: fallback });
+}const key = process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY;
+  if (!key) {
+    return json({
+      mode: "rules",
+      answer: `${fallback} (Error: GEMINI_API_KEY is missing in Vercel environment settings.)`
+    });
+  }
+
   try {
-    const response = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL ?? "gpt-4.1-mini", input: [{ role: "system", content: "You are FinMate AI. Explain only the supplied financial summary. Never claim to have made changes, guarantee results, or give regulated financial advice. Be concise and transparent." }, { role: "user", content: `Question: ${parsed.data.question}\nSummary: available ${money(summary.availableBalanceMinor)}; forecast ${money(summary.projectedBalanceMinor)}; unpaid bills ${money(summary.unpaidBillsMinor)}; expected remaining spending ${money(summary.expectedRemainingMinor)}.` }], max_output_tokens: 220 }), signal: AbortSignal.timeout(12_000) });
-    if (!response.ok) throw new Error("Provider unavailable");
-    const body = await response.json() as { output_text?: string };
-    return json({ mode: "ai", answer: typeof body.output_text === "string" ? body.output_text.trim() || fallback : fallback });
-  } catch { return json({ mode: "rules", answer: `${fallback} (The optional AI provider is unavailable, so this is a rules-based explanation.)` }); }
-}
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: `Explain this workspace summary concisely to a user:\n${fallback}`
+                }
+              ]
+            }
+          ]
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      throw new Error(`API error ${response.status}: ${errBody}`);
+    }
+
+    const body = await response.json();
+    const text = body?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    return json({
+      mode: "ai",
+      answer: typeof text === "string" && text.trim() ? text.trim() : fallback
+    });
+  } catch (err) {
+    return json({
+      mode: "rules",
+      answer: `${fallback} (AI Error: ${err instanceof Error ? err.message : "Provider request failed"})`
+    });
+  }
