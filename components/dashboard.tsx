@@ -1,10 +1,11 @@
 "use client";
 
-import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, ReactNode, Suspense, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import Link from "next/link";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import {
   Bot, CalendarClock, Check, ChevronRight, CircleDollarSign, ClipboardList,
-  Download, Edit3, Goal, LayoutDashboard, LogOut, Moon, Plus,
+  Download, Edit3, Goal, LayoutDashboard, LogOut, Menu, Moon, Plus,
   ReceiptText, RotateCcw, Search, Settings, Sparkles, Sun, Target, Trash2, TrendingDown, TrendingUp, Wallet, X
 } from "lucide-react";
 import { Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
@@ -12,6 +13,7 @@ import { makeDemoState, monthKey } from "@/lib/demo-data";
 import { cloneFinanceState, loadCloudWorkspace, syncCloudWorkspace } from "@/lib/cloud-store";
 import { budgetProgress, calculateForecast, categoryName, formatMoney, parseMoney, spendingByCategory } from "@/lib/finance";
 import { buildInsights } from "@/lib/insights";
+import { answerRulesBasedAssistant } from "@/lib/assistant-fallback";
 import { billSchema, budgetSchema, transactionSchema } from "@/lib/schemas";
 import { getSupabaseBrowserClient } from "@/lib/supabase";
 import type { Activity, Bill, Budget, Category, Currency, FinanceState, RecurringFrequency, SavingsGoal, Transaction } from "@/types/finance";
@@ -19,6 +21,7 @@ import type { Activity, Bill, Budget, Category, Currency, FinanceState, Recurrin
 type Section = "overview" | "transactions" | "budgets" | "bills" | "goals" | "assistant" | "activity" | "settings";
 type ModalState = { kind: "transaction"; record?: Transaction } | { kind: "confirm-delete"; type: "transaction"; id: string; label: string } | null;
 type WorkspaceMode = "demo" | "cloud";
+type ChatMessage = { id: string; role: "assistant" | "user"; text: string; source?: string };
 const storageKey = "finmate-fictional-demo-v1";
 const navigation: { id: Section; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard }, { id: "transactions", label: "Transactions", icon: ReceiptText }, { id: "budgets", label: "Budgets", icon: Target }, { id: "bills", label: "Bills", icon: CalendarClock }, { id: "goals", label: "Savings goals", icon: Goal }, { id: "assistant", label: "FinMate AI", icon: Sparkles }, { id: "activity", label: "Activity", icon: ClipboardList }
@@ -32,38 +35,82 @@ const compactDate = (date: string) => new Intl.DateTimeFormat("en-BD", { day: "2
 function activity(action: string, detail: string): Activity { return { id: uid(), action, detail, createdAt: new Date().toISOString() }; }
 function withActivity(state: FinanceState, entry: Activity): FinanceState { return { ...state, activities: [entry, ...state.activities].slice(0, 100) }; }
 function moneyFromMinor(minor: number) { return (minor / 100).toFixed(2); }
+function isSection(value: string | null): value is Section { return navigation.some((item) => item.id === value) || value === "settings"; }
+function assistantWelcome(mode: WorkspaceMode): ChatMessage { return { id: "welcome", role: "assistant", text: mode === "demo" ? "I can explain the fictional figures in this demo: forecast, bills, category spending, budgets, and savings goals. I do not make changes unless you confirm a proposal." : "I can explain the figures in your private workspace: forecast, bills, category spending, budgets, and savings goals. I do not make changes unless you confirm a proposal.", source: "Rules-based welcome" }; }
 
 export function Dashboard() {
-  // Render an explicitly labelled fictional workspace immediately. The effect below
-  // then restores browser-local demo data or replaces it with the signed-in cloud workspace.
-  // This avoids a blank dashboard if storage or a network request is slow or unavailable.
+  return <Suspense fallback={<main className="loading-page"><span className="brand-mark">F</span><p>Opening your workspace…</p></main>}><DashboardContent /></Suspense>;
+}
+
+function DashboardContent() {
+  const router = useRouter();
+  const pathname = usePathname() ?? "/app";
+  const searchParams = useSearchParams();
+  const demoRequested = searchParams.get("demo") === "1";
+  const requestedSection = searchParams.get("view");
+  const section: Section = isSection(requestedSection) ? requestedSection : "overview";
   const [state, setState] = useState<FinanceState>(() => makeDemoState());
   const [mode, setMode] = useState<WorkspaceMode>("demo");
   const [cloudUserId, setCloudUserId] = useState<string | null>(null);
-  const [section, setSection] = useState<Section>("overview");
   const [modal, setModal] = useState<ModalState>(null);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [toast, setToast] = useState("");
+  const [workspaceStatus, setWorkspaceStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [retry, setRetry] = useState(0);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [assistantMessages, setAssistantMessages] = useState<ChatMessage[]>(() => [assistantWelcome("demo")]);
   const cloudSync = useRef<Promise<void>>(Promise.resolve());
   const cloudBaseline = useRef<FinanceState | null>(null);
+  const cloudUserRef = useRef<string | null>(null);
   const month = monthKey();
+
+  const navigateTo = (next: Section) => {
+    if (next === section) { setMobileMenuOpen(false); return; }
+    const params = new URLSearchParams(searchParams.toString());
+    if (next === "overview") params.delete("view"); else params.set("view", next);
+    const query = params.toString();
+    setMobileMenuOpen(false);
+    router.push(query ? `${pathname}?${query}` : pathname, { scroll: false });
+  };
 
   useEffect(() => {
     let active = true;
-    async function openWorkspace() {
-      const client = getSupabaseBrowserClient();
-      if (client) {
-        const { data: { user } } = await client.auth.getUser();
-        if (user) {
-          try { const cloud = await loadCloudWorkspace(client,user.id); if (active && cloud) { cloudBaseline.current = cloneFinanceState(cloud); setMode("cloud"); setCloudUserId(user.id); setState(cloud); return; } }
-          catch { if (active) setToast("Cloud workspace could not load. Check your connection and Supabase configuration."); }
-        }
+    const client = getSupabaseBrowserClient();
+    const restoreDemo = () => {
+      let demo = makeDemoState();
+      try { const saved = localStorage.getItem(storageKey); demo = saved ? JSON.parse(saved) as FinanceState : demo; } catch { /* Use a fresh labelled demo when storage is unavailable. */ }
+      if (!active) return;
+      cloudBaseline.current = null; cloudUserRef.current = null;
+      setMode("demo"); setCloudUserId(null); setState(demo); setWorkspaceStatus("ready");
+    };
+    const openCloudWorkspace = async (userId: string) => {
+      setWorkspaceStatus("loading");
+      try {
+        if (!client) throw new Error("Cloud client unavailable.");
+        const cloud = await loadCloudWorkspace(client, userId);
+        if (!active || !cloud) return;
+        cloudBaseline.current = cloneFinanceState(cloud); cloudUserRef.current = userId;
+        setMode("cloud"); setCloudUserId(userId); setState(cloud); setWorkspaceStatus("ready");
+      } catch {
+        if (active) { setWorkspaceStatus("error"); setToast("Your session is still protected, but the cloud workspace could not load. Retry after checking the connection."); }
       }
-      try { const saved = localStorage.getItem(storageKey); if (active) setState(saved ? JSON.parse(saved) as FinanceState : makeDemoState()); }
-      catch { if (active) setState(makeDemoState()); }
+    };
+    async function openWorkspace() {
+      if (demoRequested || !client) { restoreDemo(); return; }
+      const { data: { session }, error } = await client.auth.getSession();
+      if (!active) return;
+      if (error) { setWorkspaceStatus("error"); setToast("We could not verify the saved session. Retry instead of signing in again."); return; }
+      if (!session?.user) { router.replace(`/auth?next=${encodeURIComponent(pathname)}`); return; }
+      await openCloudWorkspace(session.user.id);
     }
-    void openWorkspace(); return () => { active = false; };
-  }, []);
+    const subscription = client?.auth.onAuthStateChange((event, session) => {
+      if (!active) return;
+      if (event === "SIGNED_OUT") { if (demoRequested) restoreDemo(); else router.replace(`/auth?next=${encodeURIComponent(pathname)}`); }
+      if (event === "SIGNED_IN" && session?.user && !demoRequested) void openCloudWorkspace(session.user.id);
+    });
+    void openWorkspace();
+    return () => { active = false; subscription?.data.subscription.unsubscribe(); };
+  }, [demoRequested, pathname, retry, router]);
   useEffect(() => { if (state && mode === "demo") localStorage.setItem(storageKey, JSON.stringify(state)); }, [state, mode]);
   useEffect(() => {
     if (!state || mode !== "cloud" || !cloudUserId) return;
@@ -75,6 +122,7 @@ export function Dashboard() {
   }, [state, mode, cloudUserId]);
   useEffect(() => { document.documentElement.dataset.theme = theme; }, [theme]);
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(""), 3200); return () => clearTimeout(timer); }, [toast]);
+  useEffect(() => { setAssistantMessages([assistantWelcome(mode)]); }, [mode, cloudUserId]);
 
   const forecast = useMemo(() => state ? calculateForecast({ month, transactions: state.transactions, bills: state.bills, budgets: state.budgets, profile: state.profile }) : null, [state, month]);
   const progress = useMemo(() => state ? budgetProgress(state.budgets, state.transactions, month) : [], [state, month]);
@@ -128,26 +176,27 @@ export function Dashboard() {
     }
     mutate((current) => withActivity({ ...current, transactions: current.transactions.filter((item) => item.id !== bill.transactionId), bills: current.bills.map((item) => item.id === bill.id ? { ...item, paidAt: null, transactionId: null } : item) }, activity("Bill payment undone", `${bill.name} is again reserved as unpaid.`)), "Bill set back to unpaid");
   };
-  const resetDemo = () => { if (mode !== "demo" || !window.confirm("Reset all fictional demo data stored in this browser?")) return; setState(makeDemoState()); setSection("overview"); setToast("Fictional demo data reset"); };
+  const resetDemo = () => { if (mode !== "demo" || !window.confirm("Reset all fictional demo data stored in this browser?")) return; setState(makeDemoState()); navigateTo("overview"); setToast("Fictional demo data reset"); };
   const exportData = () => { if (!state) return; const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), fictionalDemo: mode === "demo", ...state }, null, 2)], { type: "application/json" }); const href = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = href; link.download = `finmate-${mode}-${today()}.json`; link.click(); URL.revokeObjectURL(href); setToast("Local export downloaded"); };
   const signOut = async () => { await getSupabaseBrowserClient()?.auth.signOut(); location.assign("/"); };
 
-  if (!state || !forecast) return <main className="loading-page"><span className="brand-mark">F</span><p>Opening your workspace…</p></main>;
+  if (workspaceStatus === "loading" || !forecast) return <main className="loading-page"><span className="brand-mark">F</span><p>Opening your workspace…</p></main>;
+  if (workspaceStatus === "error") return <main className="loading-page"><span className="brand-mark">F</span><p>We could not open the protected cloud workspace.</p><p className="muted">Your session was not treated as a sign-out. Check the connection, then retry.</p><div className="modal-actions"><button className="button primary" onClick={() => setRetry((value) => value + 1)}>Retry</button><Link className="button secondary" href="/app?demo=1">Open fictional demo</Link></div></main>;
   const selected = navigation.find((item) => item.id === section)?.label ?? "Settings";
-  const navButtons = navigation.map((item) => { const Icon = item.icon; return <button key={item.id} aria-label={item.label} className={section === item.id ? "active" : ""} onClick={() => setSection(item.id)}><Icon size={18}/><span>{item.label}</span></button>; });
+  const navButtons = navigation.map((item) => { const Icon = item.icon; return <button key={item.id} aria-current={section === item.id ? "page" : undefined} aria-label={item.label} className={section === item.id ? "active" : ""} onClick={() => navigateTo(item.id)}><Icon size={18}/><span>{item.label}</span></button>; });
   return <div className="workspace">
-    <aside className="sidebar"><Link className="brand" href="/"><span className="brand-mark">F</span><span>FinMate AI</span></Link><div className="demo-pill"><Sparkles size={13}/><span>{mode === "demo" ? "FICTIONAL DEMO" : "PRIVATE WORKSPACE"}</span></div><nav className="side-nav" aria-label="Finance navigation">{navButtons}</nav><div className="sidebar-bottom"><button aria-label="Settings" onClick={() => setSection("settings")}><Settings size={17}/><span>Settings</span></button><button aria-label="Sign out" onClick={signOut}><LogOut size={17}/><span>Sign out</span></button></div></aside>
-    <main className="workspace-main"><header className="topbar"><div><p className="eyebrow">{section === "overview" ? `${month} money check-in` : mode === "demo" ? "Fictional demo workspace" : "Private cloud workspace"}</p><h1>{selected}</h1>{section === "overview" && <p>Here’s a transparent view of your month so far.</p>}</div><div className="top-actions"><button className="icon-button" aria-label="Toggle theme" onClick={() => setTheme(theme === "light" ? "dark" : "light")}>{theme === "light" ? <Moon size={17}/> : <Sun size={17}/>}</button><button className="button primary" onClick={() => { setSection("transactions"); setModal({ kind: "transaction" }); }}><Plus size={16}/><span>Add transaction</span></button></div></header>
-      {section === "overview" && <Overview state={state} forecast={forecast} progress={progress} onSection={setSection} />}
+    <aside className="sidebar"><Link className="brand" href="/"><span className="brand-mark">F</span><span>FinMate AI</span></Link><div className="demo-pill"><Sparkles size={13}/><span>{mode === "demo" ? "FICTIONAL DEMO" : "PRIVATE WORKSPACE"}</span></div><nav className="side-nav" aria-label="Finance navigation">{navButtons}</nav><div className="sidebar-bottom"><button aria-label="Settings" aria-current={section === "settings" ? "page" : undefined} onClick={() => navigateTo("settings")}><Settings size={17}/><span>Settings</span></button><button aria-label="Sign out" onClick={signOut}><LogOut size={17}/><span>Sign out</span></button></div></aside>
+    <main className="workspace-main"><header className="topbar"><div><p className="eyebrow">{section === "overview" ? `${month} money check-in` : mode === "demo" ? "Fictional demo workspace" : "Private cloud workspace"}</p><h1>{selected}</h1>{section === "overview" && <p>Here’s a transparent view of your month so far.</p>}</div><div className="top-actions"><button className="icon-button" aria-label="Toggle theme" onClick={() => setTheme(theme === "light" ? "dark" : "light")}>{theme === "light" ? <Moon size={17}/> : <Sun size={17}/>}</button><button className="button primary" onClick={() => { navigateTo("transactions"); setModal({ kind: "transaction" }); }}><Plus size={16}/><span>Add transaction</span></button></div></header>
+      {section === "overview" && <Overview state={state} forecast={forecast} progress={progress} onSection={navigateTo} />}
       {section === "transactions" && <Transactions state={state} onEdit={(record) => setModal({ kind: "transaction", record })} onDelete={(record) => setModal({ kind: "confirm-delete", type: "transaction", id: record.id, label: record.description })} />}
       {section === "budgets" && <Budgets state={state} progress={progress} month={month} onMutate={mutate} />}
       {section === "bills" && <Bills state={state} onMutate={mutate} onPay={markBillPaid} onUndo={undoBillPayment} />}
       {section === "goals" && <Goals state={state} onMutate={mutate} />}
-      {section === "assistant" && <Assistant state={state} mode={mode} forecast={forecast} progress={progress} onMutate={mutate} onRefreshCloud={refreshCloudWorkspace} />}
+      {section === "assistant" && <Assistant state={state} mode={mode} forecast={forecast} progress={progress} messages={assistantMessages} onMessagesChange={setAssistantMessages} onMutate={mutate} onRefreshCloud={refreshCloudWorkspace} />}
       {section === "activity" && <ActivityLog state={state} />}
       {section === "settings" && <SettingsPage state={state} mode={mode} onMutate={mutate} onReset={resetDemo} onExport={exportData} />}
     </main>
-    <nav className="mobile-nav" aria-label="Mobile finance navigation">{navigation.slice(0, 5).map((item) => { const Icon = item.icon; return <button key={item.id} aria-label={item.label} className={section === item.id ? "active" : ""} onClick={() => setSection(item.id)}><Icon size={18}/><span>{item.label.split(" ")[0]}</span></button>; })}</nav>
+    <nav className="mobile-nav" aria-label="Mobile finance navigation">{navigation.slice(0, 4).map((item) => { const Icon = item.icon; return <button key={item.id} aria-current={section === item.id ? "page" : undefined} aria-label={item.label} className={section === item.id ? "active" : ""} onClick={() => navigateTo(item.id)}><Icon size={18}/><span>{item.label.split(" ")[0]}</span></button>; })}<div className="mobile-more"><button aria-label="More navigation options" aria-expanded={mobileMenuOpen} className={["more-trigger", ["goals", "assistant", "activity", "settings"].includes(section) ? "active" : ""].filter(Boolean).join(" ")} onClick={() => setMobileMenuOpen((open) => !open)}><Menu size={18}/><span>More</span></button>{mobileMenuOpen && <div className="mobile-more-menu">{navigation.slice(4).map((item) => { const Icon = item.icon; return <button key={item.id} aria-current={section === item.id ? "page" : undefined} className={section === item.id ? "active" : ""} onClick={() => navigateTo(item.id)}><Icon size={17}/>{item.label}</button>; })}<button aria-current={section === "settings" ? "page" : undefined} className={section === "settings" ? "active" : ""} onClick={() => navigateTo("settings")}><Settings size={17}/>Settings</button><button onClick={signOut}><LogOut size={17}/>Sign out</button></div>}</div></nav>
     {modal?.kind === "transaction" && <Dialog title={modal.record ? "Edit transaction" : "Add transaction"} description="A ledger entry immediately updates your totals and forecast." onClose={() => setModal(null)}><TransactionForm record={modal.record} state={state} onCancel={() => setModal(null)} onSubmit={(form) => { saveTransaction(form, modal.record); setModal(null); }} /></Dialog>}
     {modal?.kind === "confirm-delete" && <Dialog title="Delete transaction?" description={`“${modal.label}” will be removed from the ledger and your totals will update.`} onClose={() => setModal(null)}><div className="modal-actions"><button className="button secondary" onClick={() => setModal(null)}>Cancel</button><button className="button danger" onClick={() => { deleteTransaction(modal.id); setModal(null); }}>Delete transaction</button></div></Dialog>}
     {!state.profile.onboardingComplete && <Onboarding state={state} onComplete={(profile) => mutate((current) => withActivity({...current,profile:{...current.profile,...profile,onboardingComplete:true}},activity("Onboarding completed","Initial currency, timezone, and balance preferences saved.")),"Workspace is ready")} />}
@@ -213,38 +262,41 @@ function GoalCard({ goal, state, onMutate }: { goal: SavingsGoal; state: Finance
   return <div className="goal-item"><div className="goal-item-head"><div><h3>{goal.name}</h3><p>{goal.targetDate ? `Target: ${dateLabel(goal.targetDate)}` : "No target date"}</p></div><div className="goal-actions"><strong>{percent}%</strong><button className="small-button" aria-label={`Delete ${goal.name}`} onClick={() => { if (window.confirm(`Delete ${goal.name}?`)) onMutate((current) => withActivity({ ...current, goals:current.goals.filter((item) => item.id !== goal.id), contributions:current.contributions.filter((item) => item.goalId !== goal.id) },activity("Savings goal deleted",`${goal.name} was removed.`)),"Goal deleted"); }}><Trash2 size={16}/></button></div></div><div className="progress-row"><span>{formatMoney(goal.savedMinor,state.profile.currency)} saved</span><span>of {formatMoney(goal.targetMinor,state.profile.currency)}</span><div className="progress-track"><div className="progress-fill" style={{width:`${percent}%`,background:goal.color}}/></div></div><form className="contribution-form" onSubmit={addContribution}><input aria-label={`Contribution to ${goal.name}`} value={amount} onChange={(event) => setAmount(event.target.value)} inputMode="decimal" placeholder="Amount to add"/><button className="button secondary">Add</button></form>{error && <p className="form-error" style={{marginTop:7}}>{error}</p>}{records.length > 0 && <div className="contribution-history"><p className="muted" style={{fontSize:12,margin:"14px 0 5px"}}>Contribution record</p>{records.map((record) => <div className="contribution-record" key={record.id}><span>{dateLabel(record.date)}</span><strong>+{formatMoney(record.amountMinor,state.profile.currency)}</strong><button className="small-button" aria-label="Remove contribution" onClick={() => removeContribution(record.id)}><X size={14}/></button></div>)}</div>}</div>;
 }
 
-type ChatMessage = { id: string; role: "assistant" | "user"; text: string; source?: string };
-function Assistant({ state, mode, forecast, progress, onMutate, onRefreshCloud }: { state: FinanceState; mode: WorkspaceMode; forecast: ReturnType<typeof calculateForecast>; progress: ReturnType<typeof budgetProgress>; onMutate: (recipe: (current: FinanceState) => FinanceState, success?: string) => void; onRefreshCloud: () => Promise<void> }) {
-  const [question, setQuestion] = useState(""); const [busy, setBusy] = useState(false); const [proposal, setProposal] = useState<{ budgetId: string; currentMinor: number; proposedMinor: number; category: string } | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([{ id:"welcome", role:"assistant", text:"I can explain your forecast, upcoming bills, category budgets, and possible trade-offs. I use the figures shown in this workspace; I do not make changes unless you confirm a proposal.", source:"Rules-based welcome" }]);
+function Assistant({ state, mode, forecast, progress, messages, onMessagesChange, onMutate, onRefreshCloud }: { state: FinanceState; mode: WorkspaceMode; forecast: ReturnType<typeof calculateForecast>; progress: ReturnType<typeof budgetProgress>; messages: ChatMessage[]; onMessagesChange: Dispatch<SetStateAction<ChatMessage[]>>; onMutate: (recipe: (current: FinanceState) => FinanceState, success?: string) => void; onRefreshCloud: () => Promise<void> }) {
+  const [question, setQuestion] = useState(""); const [busy, setBusy] = useState(false); const [proposal, setProposal] = useState<{ budgetId: string; currentMinor: number; proposedMinor: number; category: string } | null>(null); const inFlight = useRef(false);
+  const appendMessage = (message: ChatMessage) => onMessagesChange((rows) => [...rows, message].slice(-24));
+  const assistantContext = useMemo(() => { const spending = spendingByCategory(state.transactions,forecast.month); return { categorySpending: state.categories.map((category) => ({ name:category.name,amountMinor:spending[category.id] ?? 0 })), upcomingBills:state.bills.filter((bill) => !bill.paidAt).sort((a,b) => a.dueDate.localeCompare(b.dueDate)).slice(0,10).map((bill) => ({ name:bill.name,amountMinor:bill.amountMinor,dueDate:bill.dueDate })), budgets:progress.map((budget) => ({ category:categoryName(state.categories,budget.categoryId),amountMinor:budget.amountMinor,spentMinor:budget.spentMinor })), goals:state.goals.map((goal) => ({ name:goal.name,targetMinor:goal.targetMinor,savedMinor:goal.savedMinor,targetDate:goal.targetDate })) }; },[forecast.month,progress,state.bills,state.categories,state.goals,state.transactions]);
   async function ask(event: FormEvent) {
-    event.preventDefault(); const text = question.trim(); if (!text) return;
-    setQuestion(""); setMessages((rows) => [...rows,{id:uid(),role:"user",text}]); setBusy(true);
+    event.preventDefault(); const text = question.trim(); if (!text || busy || inFlight.current) return;
+    const history = messages.slice(-10).map((message) => ({ role:message.role,content:message.text }));
+    inFlight.current = true; setQuestion(""); appendMessage({id:uid(),role:"user",text}); setBusy(true);
     try {
-      let result: { answer?: string; mode?: string } | null = null;
+      let result: { answer?: string; mode?: string; providerStatus?: string } | null = null;
       // For a signed-in cloud workspace, the Edge Function verifies the caller JWT
       // and queries only RLS-authorized rows. The browser never supplies a ledger.
       if (mode === "cloud") {
         const client = getSupabaseBrowserClient();
         if (client) {
-          const edge = await client.functions.invoke("finance-assistant", { body: { question: text, month: forecast.month } });
-          if (!edge.error && edge.data && typeof edge.data === "object") result = edge.data as { answer?: string; mode?: string };
+          const edge = await client.functions.invoke("finance-assistant", { body: { question: text, month: forecast.month, history } });
+          if (!edge.error && edge.data && typeof edge.data === "object") result = edge.data as { answer?: string; mode?: string; providerStatus?: string };
         }
       }
       // Demo can use the app route with fictional figures. A signed-in cloud
       // workspace never falls back to posting its financial summary elsewhere.
       if (!result && mode === "demo") {
-        const response = await fetch("/api/assistant", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({question:text,summary:{availableBalanceMinor:forecast.availableBalanceMinor,projectedBalanceMinor:forecast.projectedBalanceMinor,unpaidBillsMinor:forecast.unpaidBillsMinor,expectedRemainingMinor:forecast.expectedRemainingMinor,shortfall:forecast.shortfall},currency:state.profile.currency}) });
-        result = await response.json() as { answer?: string; mode?: string };
+        const response = await fetch("/api/assistant", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({question:text,summary:{availableBalanceMinor:forecast.availableBalanceMinor,projectedBalanceMinor:forecast.projectedBalanceMinor,unpaidBillsMinor:forecast.unpaidBillsMinor,expectedRemainingMinor:forecast.expectedRemainingMinor,shortfall:forecast.shortfall},currency:state.profile.currency,context:assistantContext,history}) });
+        if (!response.ok) throw new Error("Demo assistant request failed.");
+        result = await response.json() as { answer?: string; mode?: string; providerStatus?: string };
       }
-      const cloudFallback = `The private assistant service is unavailable, so here is the deterministic view: ${formatMoney(forecast.availableBalanceMinor,state.profile.currency)} is available now; ${formatMoney(forecast.unpaidBillsMinor,state.profile.currency)} is unpaid; and the current end-of-month estimate is ${formatMoney(forecast.projectedBalanceMinor,state.profile.currency)}. No data was changed.`;
-      setMessages((rows) => [...rows,{id:uid(),role:"assistant",text:result?.answer ?? cloudFallback,source:result?.mode === "ai" ? "AI provider" : "Rules-based fallback"}]);
-    } catch { setMessages((rows) => [...rows,{id:uid(),role:"assistant",text:"The assistant connection is unavailable. Your dashboard and deterministic forecast still work normally.",source:"Fallback"}]); }
-    finally { setBusy(false); }
+      const localFallback = answerRulesBasedAssistant({ question:text,summary:{availableBalanceMinor:forecast.availableBalanceMinor,projectedBalanceMinor:forecast.projectedBalanceMinor,unpaidBillsMinor:forecast.unpaidBillsMinor,expectedRemainingMinor:forecast.expectedRemainingMinor,shortfall:forecast.shortfall},currency:state.profile.currency,context:assistantContext });
+      const source = result?.mode === "ai" ? "AI provider" : result?.providerStatus === "not-configured" ? "Rules-based fallback — AI provider not configured" : result?.providerStatus === "unavailable" ? "Rules-based fallback — provider unavailable" : "Rules-based fallback";
+      appendMessage({id:uid(),role:"assistant",text:result?.answer || localFallback,source});
+    } catch { appendMessage({id:uid(),role:"assistant",text:answerRulesBasedAssistant({ question:text,summary:{availableBalanceMinor:forecast.availableBalanceMinor,projectedBalanceMinor:forecast.projectedBalanceMinor,unpaidBillsMinor:forecast.unpaidBillsMinor,expectedRemainingMinor:forecast.expectedRemainingMinor,shortfall:forecast.shortfall},currency:state.profile.currency,context:assistantContext }),source:"Rules-based fallback — assistant connection unavailable"}); }
+    finally { inFlight.current = false; setBusy(false); }
   }
   const insights = buildInsights(forecast,state.profile.currency);
-  function draftProposal() { const candidate = [...progress].sort((a,b) => b.percent - a.percent)[0]; if (!candidate) { setMessages((rows) => [...rows,{id:uid(),role:"assistant",text:"Create a category budget first; then I can prepare a change for your review.",source:"Rules-based fallback"}]); return; } const current = candidate.amountMinor; setProposal({budgetId:candidate.id,currentMinor:current,proposedMinor:Math.max(0,Math.round(current * .9)),category:categoryName(state.categories,candidate.categoryId)}); }
-  async function approveProposal() { if (!proposal) return; const approved = proposal; try { if (mode === "cloud") { const client = getSupabaseBrowserClient(); if (!client) throw new Error("Cloud connection unavailable."); const { error } = await client.rpc("approve_budget_proposal", { p_budget_id: approved.budgetId, p_proposed_minor: approved.proposedMinor, p_reason: `${approved.category} budget changed after explicit review.` }); if (error) throw error; await onRefreshCloud(); } else { onMutate((current) => withActivity({ ...current, budgets:current.budgets.map((item) => item.id === approved.budgetId ? {...item,amountMinor:approved.proposedMinor} : item) },activity("AI budget proposal approved",`${approved.category} budget changed from ${formatMoney(approved.currentMinor,current.profile.currency)} to ${formatMoney(approved.proposedMinor,current.profile.currency)} after review.`)), "Budget proposal applied"); } setMessages((rows) => [...rows,{id:uid(),role:"assistant",text:`You approved the ${approved.category} budget change. The dashboard has been recalculated.`,source:"Confirmed action"}]); setProposal(null); } catch { setMessages((rows) => [...rows,{id:uid(),role:"assistant",text:"The budget change was not saved. Review your connection and try again; no local change was applied.",source:"Safe failure"}]); } }
+  function draftProposal() { const candidate = [...progress].sort((a,b) => b.percent - a.percent)[0]; if (!candidate) { appendMessage({id:uid(),role:"assistant",text:"Create a category budget first; then I can prepare a change for your review.",source:"Rules-based fallback"}); return; } const current = candidate.amountMinor; setProposal({budgetId:candidate.id,currentMinor:current,proposedMinor:Math.max(0,Math.round(current * .9)),category:categoryName(state.categories,candidate.categoryId)}); }
+  async function approveProposal() { if (!proposal) return; const approved = proposal; try { if (mode === "cloud") { const client = getSupabaseBrowserClient(); if (!client) throw new Error("Cloud connection unavailable."); const { error } = await client.rpc("approve_budget_proposal", { p_budget_id: approved.budgetId, p_proposed_minor: approved.proposedMinor, p_reason: `${approved.category} budget changed after explicit review.` }); if (error) throw error; await onRefreshCloud(); } else { onMutate((current) => withActivity({ ...current, budgets:current.budgets.map((item) => item.id === approved.budgetId ? {...item,amountMinor:approved.proposedMinor} : item) },activity("AI budget proposal approved",`${approved.category} budget changed from ${formatMoney(approved.currentMinor,current.profile.currency)} to ${formatMoney(approved.proposedMinor,current.profile.currency)} after review.`)), "Budget proposal applied"); } appendMessage({id:uid(),role:"assistant",text:`You approved the ${approved.category} budget change. The dashboard has been recalculated.`,source:"Confirmed action"}); setProposal(null); } catch { appendMessage({id:uid(),role:"assistant",text:"The budget change was not saved. Review your connection and try again; no local change was applied.",source:"Safe failure"}); } }
   return <section className="section-page"><div className="page-head"><div><h1>FinMate AI</h1><p>Clear explanations and reviewable suggestions—not financial advice.</p></div></div><div className="assistant-layout"><article className="card chat"><div className="card-head"><div><h2>Money conversation</h2><p>Uses the current workspace summary. It never changes data by itself.</p></div><Bot size={21} color="#477d71"/></div>{messages.map((message) => <div className={`message ${message.role === "user" ? "user" : ""}`} key={message.id}>{message.text}{message.source && <small>{message.source}</small>}</div>)}{busy && <div className="message">Thinking through the figures…</div>}<form className="ask-form" onSubmit={ask}><input value={question} onChange={(event) => setQuestion(event.target.value)} maxLength={700} placeholder="How do upcoming bills affect me?" aria-label="Ask FinMate AI"/><button className="button primary" disabled={busy}>Ask</button></form></article><aside className="card"><div className="card-head"><div><h2>Signals</h2><p>Based on your recorded data</p></div></div><div className="insight-list">{insights.map((insight) => <div key={insight.title} className={`insight ${insight.tone}`}><strong>{insight.title}</strong><p>{insight.body}</p></div>)}</div><button className="button secondary full" style={{marginTop:14}} onClick={draftProposal}><Sparkles size={15}/>Draft a budget change</button>{proposal && <div className="proposal" style={{marginTop:13}}><strong>Review proposed change</strong><p>Reduce the {proposal.category} budget from {formatMoney(proposal.currentMinor,state.profile.currency)} to {formatMoney(proposal.proposedMinor,state.profile.currency)}. This changes your budget plan only; it does not change past spending.</p><div className="proposal-actions"><button className="button primary" onClick={approveProposal}>Approve change</button><button className="button secondary" onClick={() => setProposal(null)}>Reject</button></div></div>}</aside></div></section>;
 }
 

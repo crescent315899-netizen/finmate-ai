@@ -9,6 +9,8 @@ const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 // presence. Keep that compatibility cast isolated at the SDK boundary.
 type AuthCompatibility = {
   getUser: () => Promise<{ data: { user: { id: string } | null }; error: unknown }>;
+  getSession: () => Promise<{ data: { session: { user: { id: string } } | null }; error: unknown }>;
+  onAuthStateChange: (callback: (event: string, session: { user: { id: string } } | null) => void) => { data: { subscription: { unsubscribe: () => void } } };
   signOut: () => Promise<{ error: unknown }>;
   signInWithPassword: (credentials: { email: string; password: string }) => Promise<{ error: Error | null }>;
   signUp: (credentials: { email: string; password: string; options?: { emailRedirectTo?: string } }) => Promise<{ error: Error | null }>;

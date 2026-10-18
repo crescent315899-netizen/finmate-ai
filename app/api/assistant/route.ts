@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
+import { answerRulesBasedAssistant } from "@/lib/assistant-fallback";
 import { assistantRequestSchema } from "@/lib/schemas";
-import { formatMoney } from "@/lib/finance";
 
 export const runtime = "nodejs";
 
@@ -30,17 +30,33 @@ export async function POST(request: Request) {
   if (isRateLimited(clientKey)) return json({ error: "Too many assistant requests. Please try again shortly." }, 429);
   const parsed = assistantRequestSchema.safeParse(await request.json().catch(() => null));
   if (!parsed.success) return json({ error: "Invalid assistant request." }, 400);
-  const { summary, currency } = parsed.data;
-  const money = (amount: number) => formatMoney(amount, currency);
-  const fallback = summary.shortfall
-    ? `Your plan currently ends about ${money(Math.abs(summary.projectedBalanceMinor))} below zero. The first place to look is the ${money(summary.expectedRemainingMinor)} reserved for additional spending; unpaid bills of ${money(summary.unpaidBillsMinor)} should remain reserved.`
-    : `Your estimate ends with ${money(summary.projectedBalanceMinor)}. That includes ${money(summary.unpaidBillsMinor)} in unpaid bills and ${money(summary.expectedRemainingMinor)} for future spending. It is an estimate, not a guarantee.`;
+
+  const { question, summary, currency, context, history } = parsed.data;
+  const fallback = answerRulesBasedAssistant({ question, summary, currency, context });
   const key = process.env.OPENAI_API_KEY;
-  if (!key) return json({ mode: "rules", answer: fallback });
+  if (!key) return json({ mode: "rules", providerStatus: "not-configured", answer: fallback });
+
+  const workspaceContext = JSON.stringify({ summary, currency, context });
   try {
-    const response = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` }, body: JSON.stringify({ model: process.env.OPENAI_MODEL ?? "gpt-4.1-mini", input: [{ role: "system", content: "You are FinMate AI. Explain only the supplied financial summary. Never claim to have made changes, guarantee results, or give regulated financial advice. Be concise and transparent." }, { role: "user", content: `Question: ${parsed.data.question}\nSummary: available ${money(summary.availableBalanceMinor)}; forecast ${money(summary.projectedBalanceMinor)}; unpaid bills ${money(summary.unpaidBillsMinor)}; expected remaining spending ${money(summary.expectedRemainingMinor)}.` }], max_output_tokens: 220 }), signal: AbortSignal.timeout(12_000) });
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL ?? "gpt-4.1-mini",
+        input: [
+          { role: "system", content: "You are FinMate AI. Use only the supplied fictional-demo financial context. Explain records, deterministic estimates, and optional trade-offs concisely. Do not invent transactions, claim to have changed data, guarantee outcomes, or provide regulated financial advice." },
+          ...history.map((message) => ({ role: message.role, content: message.content })),
+          { role: "user", content: `Question: ${question}\n\nAuthorized workspace context: ${workspaceContext}` }
+        ],
+        max_output_tokens: 260
+      }),
+      signal: AbortSignal.timeout(12_000)
+    });
     if (!response.ok) throw new Error("Provider unavailable");
     const body = await response.json() as { output_text?: string };
-    return json({ mode: "ai", answer: typeof body.output_text === "string" ? body.output_text.trim() || fallback : fallback });
-  } catch { return json({ mode: "rules", answer: `${fallback} (The optional AI provider is unavailable, so this is a rules-based explanation.)` }); }
+    const answer = typeof body.output_text === "string" ? body.output_text.trim() : "";
+    return json({ mode: answer ? "ai" : "rules", providerStatus: answer ? "available" : "empty-response", answer: answer || fallback });
+  } catch {
+    return json({ mode: "rules", providerStatus: "unavailable", answer: fallback });
+  }
 }

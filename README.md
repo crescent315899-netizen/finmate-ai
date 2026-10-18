@@ -2,7 +2,7 @@
 
 FinMate AI is a responsive, installable personal-finance workspace. It helps people record income and expenses, plan category budgets, reserve upcoming bills, track savings goals, and understand an estimated end-of-month balance.
 
-It is designed to remain useful with no credentials: opening `/app` without a signed-in Supabase session starts a clearly labelled, fictional browser-local demo. This demo is not cloud-synced and must never be used as a substitute for a backup.
+It is designed to remain useful with no credentials: open `/app?demo=1` for a clearly labelled, fictional browser-local demo. When Supabase is configured, `/app` itself is protected for signed-in cloud workspaces. The demo is not cloud-synced and must never be used as a substitute for a backup.
 
 ## What is included
 
@@ -12,7 +12,7 @@ It is designed to remain useful with no credentials: opening `/app` without a si
 - Default and custom categories; monthly budgets and progress warnings; savings goals with contribution history.
 - Bills with overdue/upcoming/paid states. Marking a bill paid adds one linked ledger entry, and undoing it removes the linked entry—so forecasts do not double-count it.
 - Deterministic forecast with integer-minor-unit arithmetic, transparent inputs, custom expected-spending adjustment, and shortfall warnings.
-- Assistant UI with a server-side optional AI provider and an honest, rules-based fallback. Budget proposals require explicit review and approval before they change a budget.
+- Assistant UI with a server-side optional AI provider and a question-specific, data-grounded rules-based fallback. Budget proposals require explicit review and approval before they change a budget.
 - Activity history, JSON export, Supabase migrations, RLS policies, same-owner reference guards, non-destructive cross-device sync, and atomic database RPCs for paid bills and approved budget proposals.
 
 ## Technology
@@ -29,7 +29,7 @@ pnpm install
 pnpm dev
 ```
 
-The development command prints the actual URL (normally `http://localhost:3000`). Open `/` for the landing page or `/app` for the demo workspace.
+The development command prints the actual URL (normally `http://localhost:3000`). Open `/` for the landing page, `/app?demo=1` for the fictional demo, or `/app` after signing in to a configured cloud workspace.
 
 ```powershell
 pnpm lint
@@ -41,7 +41,7 @@ pnpm start
 
 ## Demo mode
 
-Without a configured and signed-in Supabase account, FinMate shows a **FICTIONAL DEMO** workspace. Its records are saved in this browser under a local-storage key, can be exported as JSON, and can be reset from Settings. It does not sync to other devices and it never claims to be private cloud storage.
+The explicit `/app?demo=1` route shows the **FICTIONAL DEMO** workspace. Its records are saved in this browser under a local-storage key, can be exported as JSON, and can be reset from Settings. It does not sync to other devices and it never claims to be private cloud storage.
 
 The sample plan uses BDT values and demonstrates the calculation:
 
@@ -71,7 +71,7 @@ Create two ordinary test accounts, add a transaction as each, then sign in separ
 
 ## Optional AI provider
 
-The UI works without an AI key. In demo mode, `/api/assistant` receives a compact pre-calculated summary and returns an honest rules-based explanation if no provider is configured. In a signed-in cloud workspace, the UI invokes the Supabase Edge Function, which verifies the JWT and queries the user’s RLS-authorized data itself; the browser does not send a ledger or provider key.
+The UI works without an AI key. In demo mode, `/api/assistant` validates a compact fictional context and returns a question-specific rules-based explanation if no provider is configured. In a signed-in cloud workspace, the UI invokes the Supabase Edge Function, which verifies the JWT and queries the user’s RLS-authorized data itself; the browser does not send a ledger or provider key. Conversation context is bounded to the current workspace session and is never mixed between accounts.
 
 Set these server-only values locally or in Vercel:
 
@@ -87,7 +87,7 @@ supabase functions deploy finance-assistant
 supabase secrets set OPENAI_API_KEY=your-server-only-key OPENAI_MODEL=gpt-4.1-mini
 ```
 
-The assistant cannot directly apply a recommendation. It can only explain data or prepare a proposal; the person must approve the proposal, which creates an activity-history entry. The demo endpoint returns `no-store` responses, caps request payloads, applies a best-effort per-instance rate limit, and falls back after a 12-second provider timeout.
+The assistant cannot directly apply a recommendation. It can only explain data or prepare a proposal; the person must approve the proposal, which creates an activity-history entry. The demo endpoint returns `no-store` responses, caps request payloads, prevents duplicate in-flight submissions, applies a best-effort per-instance rate limit, and falls back after a 12-second provider timeout.
 
 ## Deployment to Vercel
 
@@ -115,7 +115,7 @@ Open the deployed HTTPS site in a compatible browser, then choose the browser’
 | `lib/cloud-store.ts` | Authenticated RLS-scoped Supabase read/sync adapter |
 | `supabase/migrations/` | Versioned PostgreSQL schema, explicit Data API grants, RLS, triggers, indexes, and RPCs |
 | `supabase/functions/finance-assistant/` | RLS-scoped controlled assistant Edge Function |
-| `tests/finance.test.ts` | Forecast, validation, budget, date-boundary, and double-counting tests |
+| `tests/finance.test.ts`, `tests/assistant-fallback.test.ts` | Forecast, validation, budget, date-boundary, double-counting, and question-specific fallback tests |
 
 ## Troubleshooting
 
