@@ -4,6 +4,23 @@ import { assistantRequestSchema } from "@/lib/schemas";
 
 export const runtime = "nodejs";
 
+function extractResponseText(body: unknown): string {
+  if (!body || typeof body !== "object") return "";
+  const response = body as {
+    output_text?: unknown;
+    output?: Array<{ type?: string; content?: Array<{ type?: string; text?: unknown }> }>;
+  };
+  if (typeof response.output_text === "string" && response.output_text.trim()) return response.output_text.trim();
+  return (response.output ?? [])
+    .filter((item) => item?.type === "message")
+    .flatMap((item) => item.content ?? [])
+    .filter((part) => part?.type === "output_text" && typeof part.text === "string")
+    .map((part) => String(part.text))
+    .join("\n")
+    .trim();
+}
+
+
 const WINDOW_MS = 5 * 60 * 1_000;
 const MAX_REQUESTS_PER_WINDOW = 12;
 const requestWindows = new Map<string, { count: number; resetAt: number }>();
@@ -53,8 +70,8 @@ export async function POST(request: Request) {
       signal: AbortSignal.timeout(12_000)
     });
     if (!response.ok) throw new Error("Provider unavailable");
-    const body = await response.json() as { output_text?: string };
-    const answer = typeof body.output_text === "string" ? body.output_text.trim() : "";
+    const body: unknown = await response.json();
+    const answer = extractResponseText(body);
     return json({ mode: answer ? "ai" : "rules", providerStatus: answer ? "available" : "empty-response", answer: answer || fallback });
   } catch {
     return json({ mode: "rules", providerStatus: "unavailable", answer: fallback });
