@@ -2,6 +2,22 @@
 // This function deliberately uses the caller JWT and RLS—not the service role—to scope all data.
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
+function extractResponseText(body: unknown): string {
+  if (!body || typeof body !== "object") return "";
+  const response = body as {
+    output_text?: unknown;
+    output?: Array<{ type?: string; content?: Array<{ type?: string; text?: unknown }> }>;
+  };
+  if (typeof response.output_text === "string" && response.output_text.trim()) return response.output_text.trim();
+  return (response.output ?? [])
+    .filter((item) => item?.type === "message")
+    .flatMap((item) => item.content ?? [])
+    .filter((part) => part?.type === "output_text" && typeof part.text === "string")
+    .map((part) => String(part.text))
+    .join("\n")
+    .trim();
+}
+
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type" } });
 const currentMonth = () => new Date().toISOString().slice(0,7);
 const nextMonthStart = (month: string) => {
@@ -76,6 +92,6 @@ Deno.serve(async (request) => {
   const history = Array.isArray(body.history) ? body.history.slice(-10).flatMap((item) => item && (item.role === "user" || item.role === "assistant") && typeof item.content === "string" && item.content.trim() ? [{ role:item.role,content:item.content.trim().slice(0,1000) }] : []) : [];
   try {
     const response = await fetch("https://api.openai.com/v1/responses",{method:"POST",headers:{"Content-Type":"application/json","Authorization":`Bearer ${key}`},body:JSON.stringify({model:Deno.env.get("OPENAI_MODEL") ?? "gpt-4.1-mini",input:[{role:"system",content:"You are FinMate AI. Use only the supplied authorized tool results. Do not invent values, perform actions, promise outcomes, or provide regulated financial advice. Keep the answer concise."},...history,{role:"user",content:`Question: ${question}\nAuthorized tools: ${JSON.stringify(tools)}`}],max_output_tokens:260}),signal:AbortSignal.timeout(12_000)});
-    if (!response.ok) throw new Error("Provider error"); const output = await response.json(); const answer = typeof output.output_text === "string" ? output.output_text.trim() : ""; return json({mode:answer ? "ai" : "rules",providerStatus:answer ? "available" : "empty-response",answer:answer || fallback,tools});
+    if (!response.ok) throw new Error("Provider error"); const output = await response.json(); const answer = extractResponseText(output); return json({mode:answer ? "ai" : "rules",providerStatus:answer ? "available" : "empty-response",answer:answer || fallback,tools});
   } catch { return json({mode:"rules",providerStatus:"unavailable",answer:fallback,tools}); }
 });
